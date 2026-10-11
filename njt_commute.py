@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Recommend a Secaucus Junction departure for New York Penn."""
+"""Query live NJ TRANSIT station departures and the RVR-to-Secaucus commute."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -97,6 +101,7 @@ class RailDataClient:
         cache_identity = f"{username}\0{api_base}"
         self.username_fingerprint = hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()
         self._token: str | None = self._load_cached_token()
+        self._token_lock = threading.Lock()
 
     def _load_cached_token(self) -> str | None:
         try:
@@ -179,22 +184,31 @@ class RailDataClient:
         return token
 
     def token(self) -> str:
-        return self._token or self._issue_token()
+        if self._token:
+            return self._token
+        with self._token_lock:
+            return self._token or self._issue_token()
 
     def call(self, operation: str, fields: dict[str, str] | None = None) -> object:
         request_fields = dict(fields or {})
-        request_fields["token"] = self.token()
+        used_token = self.token()
+        request_fields["token"] = used_token
         status, payload = self._post(operation, request_fields)
 
         # Tokens last for hours; mint a replacement only if the data API says the
         # cached token is unauthorized, then retry the read once.
         if status == 401:
-            self._token = None
-            try:
-                self.cache_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            request_fields["token"] = self._issue_token()
+            with self._token_lock:
+                if self._token == used_token:
+                    self._token = None
+                    try:
+                        self.cache_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    refreshed_token = self._issue_token()
+                else:
+                    refreshed_token = self._token or self._issue_token()
+            request_fields["token"] = refreshed_token
             status, payload = self._post(operation, request_fields)
 
         if status >= 400:
@@ -238,6 +252,87 @@ def find_secaucus_code(payload: object, destination: str = "New York Penn") -> s
     raise RuntimeError(f"The RailData station list did not contain Secaucus {level} level.")
 
 
+def station_identity(name: str) -> str:
+    """Normalize common station labels without losing ordinary station names."""
+    lowered = name.casefold().strip()
+    if "secaucus" in lowered:
+        return "secaucus junction"
+    if "hoboken" in lowered:
+        return "hoboken"
+    if "penn" in lowered and (
+        "new york" in lowered
+        or lowered.replace(" ", "") in {"nyp", "nypenn", "pennstation"}
+    ):
+        return "new york penn"
+    if lowered.replace(" ", "") in {"nyp", "nypenn", "pennstation"}:
+        return "new york penn"
+
+    words = re.sub(r"[^a-z0-9]+", " ", lowered).split()
+    abbreviations = {"jct": "junction", "stn": "station"}
+    words = [abbreviations.get(word, word) for word in words]
+    words = [word for word in words if word not in {"station", "junction", "terminal"}]
+    return " ".join(words)
+
+
+def resolve_station_code(
+    payload: object,
+    origin: str,
+    destination: str,
+) -> tuple[str, str]:
+    """Resolve a user-facing station name to RailData's station code."""
+    stations = payload if isinstance(payload, list) else []
+    wanted = station_identity(origin)
+
+    if wanted == "secaucus junction":
+        destination_key = station_identity(destination)
+        if destination_key == "hoboken":
+            level = "lower"
+        elif destination_key == "new york penn":
+            level = "upper"
+        else:
+            raise RuntimeError(
+                "Secaucus Junction has separate train platforms; use Hoboken or New York Penn as the destination."
+            )
+        for station in stations:
+            name = str(value(station, "STATIONNAME", ""))
+            lowered = name.casefold()
+            if "secaucus" in lowered and level in lowered:
+                code = value(station, "STATION_2CHAR")
+                if code:
+                    return str(code), name
+        raise RuntimeError(f"The RailData station list did not contain the Secaucus {level} platform.")
+
+    entries: list[tuple[str, str]] = []
+    for station in stations:
+        code = value(station, "STATION_2CHAR")
+        name = str(value(station, "STATIONNAME", "")).strip()
+        if code and name:
+            entries.append((str(code), name))
+
+    exact = [entry for entry in entries if station_identity(entry[1]) == wanted]
+    unique_exact = list(dict.fromkeys(exact))
+    if len(unique_exact) == 1:
+        return unique_exact[0]
+    if len(unique_exact) > 1:
+        codes = {entry[0] for entry in unique_exact}
+        if len(codes) == 1:
+            return unique_exact[0]
+        names = ", ".join(entry[1] for entry in unique_exact)
+        raise RuntimeError(f"Station name '{origin}' is ambiguous in RailData: {names}.")
+
+    partial = [
+        entry for entry in entries
+        if wanted and (wanted in station_identity(entry[1]) or station_identity(entry[1]) in wanted)
+    ]
+    unique_partial = list(dict.fromkeys(partial))
+    if len({entry[0] for entry in unique_partial}) == 1 and unique_partial:
+        return unique_partial[0]
+    if unique_partial:
+        names = ", ".join(entry[1] for entry in unique_partial[:8])
+        raise RuntimeError(f"Station name '{origin}' is ambiguous in RailData; matches: {names}.")
+    raise RuntimeError(f"RailData did not recognize the origin station '{origin}'.")
+
+
 def as_rows(payload: object) -> list[dict[str, object]]:
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
@@ -249,10 +344,10 @@ def as_rows(payload: object) -> list[dict[str, object]]:
 
 
 def destination_group(destination: str) -> str | None:
-    lowered = destination.casefold()
-    if "hoboken" in lowered:
+    identity = station_identity(destination)
+    if identity == "hoboken":
         return "Hoboken"
-    if "new york" in lowered or "penn" in lowered or lowered in {"nyp", "ny penn"}:
+    if identity == "new york penn":
         return "New York Penn"
     return None
 
@@ -345,14 +440,369 @@ def stop_for_station(
         if not isinstance(stop, dict):
             continue
         name = str(value(stop, "STATIONNAME", "")).casefold()
-        if station == "Secaucus Junction" and "secaucus" in name:
-            return stop
-        if station == "New York Penn" and (
-            ("new york" in name and "penn" in name)
-            or name.strip() in {"nyp", "ny penn", "ny penn station", "penn station"}
-        ):
+        if station_identity(name) == station_identity(station):
             return stop
     return None
+
+
+def row_serves_route(
+    row: dict[str, object],
+    origin: str,
+    destination: str,
+) -> bool:
+    """Use the ordered stop list when present; otherwise match the board destination."""
+    stops = value(row, "STOPS", [])
+    if isinstance(stops, list):
+        origin_index: int | None = None
+        destination_index: int | None = None
+        for index, stop in enumerate(stops):
+            if not isinstance(stop, dict):
+                continue
+            name = str(value(stop, "STATIONNAME", ""))
+            if station_identity(name) == station_identity(origin) and origin_index is None:
+                origin_index = index
+            if station_identity(name) == station_identity(destination) and destination_index is None:
+                destination_index = index
+        if destination_index is not None:
+            return origin_index is None or destination_index > origin_index
+
+    return station_identity(str(value(row, "DESTINATION", ""))) == station_identity(destination)
+
+
+def format_delay_detail(raw_seconds: object) -> str:
+    if raw_seconds is None or not str(raw_seconds).strip():
+        return "delay unavailable"
+    seconds = seconds_late(raw_seconds)
+    if seconds > 0:
+        return f"{max(1, round(seconds / 60))} min late"
+    if seconds < 0:
+        return f"{max(1, round(abs(seconds) / 60))} min early"
+    return "0 sec delay field"
+
+
+def timestamp_age_seconds(raw_timestamp: object, now: datetime) -> int | None:
+    timestamp = parse_feed_datetime(raw_timestamp, now)
+    if timestamp is None:
+        return None
+    return max(0, int((now - timestamp).total_seconds()))
+
+
+def elapsed_since(raw_timestamp: object, now: datetime) -> str:
+    seconds = timestamp_age_seconds(raw_timestamp, now)
+    if seconds is None:
+        return "更新时间未知"
+    if seconds <= 30:
+        label = "新鲜"
+    elif seconds <= 60:
+        label = "稍旧"
+    elif seconds <= 120:
+        label = "已旧"
+    else:
+        label = "很旧"
+    return f"{seconds} 秒前更新（{label}）"
+
+
+def stops_remaining(vehicle: dict[str, object], stops: object, destination: str) -> int | None:
+    """Count stops from the vehicle's next stop through the destination, inclusive."""
+    next_stop = str(value(vehicle, "NEXT_STOP", "") or value(vehicle, "NEXT_STATION", "")).strip()
+    if not next_stop or not isinstance(stops, list):
+        return None
+
+    names = [
+        str(value(stop, "STATIONNAME", "")).strip()
+        for stop in stops
+        if isinstance(stop, dict)
+    ]
+    next_identity = station_identity(next_stop)
+    destination_identity = station_identity(destination)
+    next_indices = [index for index, name in enumerate(names) if station_identity(name) == next_identity]
+    destination_indices = [
+        index for index, name in enumerate(names)
+        if station_identity(name) == destination_identity
+    ]
+    if not next_indices or not destination_indices:
+        return None
+
+    next_index = next_indices[0]
+    next_record = stop_for_station(stops, next_stop)
+    if next_record and str(value(next_record, "DEPARTED", "")).strip().casefold() == "yes":
+        return None
+    destination_index = next((index for index in destination_indices if index >= next_index), None)
+    if destination_index is None:
+        return None
+    return destination_index - next_index + 1
+
+
+def select_gps_sample(row: dict[str, object], vehicle: dict[str, object], now: datetime) -> tuple[str, str, str]:
+    """Choose a complete GPS sample; never attach another source's timestamp."""
+    samples = [
+        (value(vehicle, "LATITUDE", ""), value(vehicle, "LONGITUDE", ""), value(vehicle, "LAST_MODIFIED", "")),
+        (value(row, "GPSLATITUDE", ""), value(row, "GPSLONGITUDE", ""), value(row, "GPSTIME", "")),
+    ]
+    valid = []
+    for lat, lon, timestamp in samples:
+        try:
+            latitude, longitude = float(str(lat)), float(str(lon))
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180) or (latitude == 0 and longitude == 0):
+            continue
+        age = timestamp_age_seconds(timestamp, now)
+        valid.append((age if age is not None else float("inf"), str(lat), str(lon), str(timestamp or "")))
+    if not valid:
+        return "", "", ""
+    _, latitude, longitude, timestamp = min(valid, key=lambda sample: sample[0])
+    return latitude, longitude, timestamp
+
+
+def markdown_cell(text: object) -> str:
+    return " ".join(str(text).replace("|", "\\|").split())
+
+
+def display_delay(raw_seconds: object) -> str:
+    if raw_seconds is None or not str(raw_seconds).strip():
+        return "—"
+    seconds = seconds_late(raw_seconds)
+    if seconds > 0:
+        minutes, remainder = divmod(seconds, 60)
+        return f"晚 {minutes}分{remainder:02d}秒"
+    if seconds < 0:
+        minutes, remainder = divmod(abs(seconds), 60)
+        return f"早 {minutes}分{remainder:02d}秒"
+    return "0 分钟"
+
+
+def route_advisories(
+    payload: object,
+    origin: str,
+    destination: str,
+    departures: list[dict[str, object]],
+) -> list[str]:
+    notices = value(payload, "STATIONMSGS", [])
+    if not isinstance(notices, list):
+        return []
+    destination_key = station_identity(destination)
+    relevant_terms = {destination_key, "portal cutover", "cross honoring", "all rail service"}
+    relevant_terms.update(str(item["line"]).casefold() for item in departures if item["line"])
+    relevant_terms.update(str(item["train_id"]).casefold() for item in departures)
+    if destination_key == "new york penn":
+        relevant_terms.update({"penn", "psny"})
+    if station_identity(origin) == "secaucus junction":
+        relevant_terms.add("secaucus")
+    route_train_ids = {
+        str(value(row, "TRAIN_ID", "")).strip()
+        for row in as_rows(payload)
+        if row_serves_route(row, origin, destination)
+    }
+
+    messages: list[str] = []
+    for notice in notices:
+        message = " ".join(str(value(notice, "MSG_TEXT", "")).split())
+        lowered = message.casefold()
+        primary_train = re.search(r"train\s*#\s*(\d+)", lowered)
+        if primary_train and primary_train.group(1) not in route_train_ids:
+            continue
+        if message and any(term and term in lowered for term in relevant_terms):
+            messages.append(message)
+    return sorted(list(dict.fromkeys(messages)), key=lambda message: 0 if "portal cutover" in message.casefold() else 1)
+
+
+def print_route_board(
+    origin: str,
+    destination: str,
+    station_label: str,
+    board_payload: object,
+    vehicles: list[dict[str, object]],
+    now: datetime,
+) -> None:
+    rows = as_rows(board_payload)
+    matching = [row for row in rows if row_serves_route(row, origin, destination)]
+    vehicle_by_id = {str(value(vehicle, "ID", "")).strip(): vehicle for vehicle in vehicles}
+    departures: list[dict[str, object]] = []
+
+    for row in matching:
+        status = str(value(row, "STATUS", "")).strip()
+        if "cancel" in status.casefold():
+            continue
+        origin_stop = stop_for_station(value(row, "STOPS", []), origin)
+        if origin_stop and "cancel" in str(value(origin_stop, "STOP_STATUS", "")).casefold():
+            continue
+        if origin_stop and str(value(origin_stop, "DEPARTED", "")).strip().casefold() == "yes":
+            continue
+
+        scheduled = parse_feed_datetime(value(row, "SCHED_DEP_DATE", ""), now)
+        if scheduled is None and origin_stop:
+            scheduled = parse_feed_datetime(
+                value(origin_stop, "DEP_TIME", "") or value(origin_stop, "TIME", ""), now
+            )
+        if scheduled is None:
+            continue
+
+        raw_delay = value(row, "SEC_LATE", None)
+        delay = seconds_late(raw_delay)
+        board_estimate = scheduled + timedelta(seconds=delay)
+        stop_departure = None
+        if origin_stop:
+            stop_departure = parse_feed_datetime(
+                value(origin_stop, "DEP_TIME", "") or value(origin_stop, "TIME", ""), now
+            )
+        # DEP_TIME is the planned time; comparing it with a delay-adjusted
+        # estimate is not evidence of a feed conflict. Keep them separate.
+        estimated = board_estimate
+        boarding_time = min(scheduled, estimated) if scheduled >= now else estimated
+        if estimated < now:
+            continue
+        train_id = str(value(row, "TRAIN_ID", "")).strip()
+        vehicle = vehicle_by_id.get(train_id, {})
+        latitude, longitude, gps_time = select_gps_sample(row, vehicle, now)
+        destination_stop = stop_for_station(value(row, "STOPS", []), destination)
+        departures.append({
+            "row": row,
+            "train_id": train_id or "ID unavailable",
+            "scheduled": scheduled,
+            "estimated": estimated,
+            "boarding_time": boarding_time,
+            "board_estimate": board_estimate,
+            "stop_departure": stop_departure,
+            "raw_delay": raw_delay,
+            "delay": delay,
+            "status": status or "status unavailable",
+            "line": str(value(row, "LINEABBREVIATION", "") or value(row, "LINE", "")).strip(),
+            "origin_stop": origin_stop,
+            "destination_stop": destination_stop,
+            "latitude": latitude,
+            "longitude": longitude,
+            "gps_time": gps_time,
+            "vehicle": vehicle,
+            "next_stop_age": timestamp_age_seconds(value(vehicle, "LAST_MODIFIED", ""), now),
+            "origin_remaining": stops_remaining(vehicle, value(row, "STOPS", []), origin),
+            "stops_remaining": stops_remaining(
+                vehicle,
+                value(row, "STOPS", []),
+                destination,
+            ),
+        })
+
+    departures.sort(key=lambda item: item["estimated"])
+    print(f"**NJ TRANSIT 实时班次：{origin} → {destination}**")
+    print(
+        f"数据快照：{now.strftime('%Y-%m-%d %I:%M:%S %p ET')} · "
+        f"站台：{station_label} · 班次板 {len(rows)} 行，匹配 {len(matching)} 班"
+    )
+
+    if not departures:
+        print("班次板没有返回符合路线的后续列车。")
+    else:
+        print()
+        print(
+            f"| 计划发车 (ET) | 估算发车 (ET) | 列车 / 线路 | "
+            f"班次板延误 | 停站状态 | "
+            f"当前 GPS 位置 / 下一站 | 距 {markdown_cell(origin)} 直线距离 | "
+            f"余站：到上车站 / 到终点* |"
+        )
+        print("|---|---|---|---|---|---|---:|---:|")
+        for item in departures[:8]:
+            train = str(item["train_id"])
+            if item["line"]:
+                train += f" / {item['line']}"
+
+            origin_stop = item["origin_stop"]
+            stop_status = str(value(origin_stop, "STOP_STATUS", "") if origin_stop else "").strip() or "—"
+            stop_departure = item["stop_departure"]
+            board_estimate = item["board_estimate"]
+
+            location = "GPS 不可用"
+            next_stop = str(
+                value(item["vehicle"], "NEXT_STOP", "")
+                or value(item["vehicle"], "NEXT_STATION", "")
+            ).strip()
+            if item["latitude"] and item["longitude"]:
+                try:
+                    coordinate_text = f"{float(item['latitude']):.5f}, {float(item['longitude']):.5f}"
+                except (TypeError, ValueError):
+                    coordinate_text = f"{item['latitude']}, {item['longitude']}"
+                location = coordinate_text
+            if next_stop:
+                location += f"<br>下一站：{markdown_cell(next_stop)}"
+                if item["next_stop_age"] is not None:
+                    location += f"（{item['next_stop_age']} 秒前）"
+            if item["gps_time"]:
+                location += f"<br>{elapsed_since(item['gps_time'], now)}"
+
+            distance_text = "—"
+            if item["latitude"] and item["longitude"] and station_identity(origin) == "secaucus junction":
+                distance = straight_line_distance_miles(item["latitude"], item["longitude"])
+                if distance is not None:
+                    distance_text = f"{distance:.1f} mi / {distance * 1.609344:.1f} km"
+
+            age = item["next_stop_age"]
+            if item["stops_remaining"] is None or age is None or age > 120:
+                remaining_text = "—"
+            else:
+                origin_count = item["origin_remaining"]
+                prefix = "约 " if age > 60 else ""
+                remaining_text = f"{prefix}{origin_count if origin_count is not None else '—'} / {item['stops_remaining']}"
+            departure_time = item["estimated"].strftime("%I:%M:%S %p")
+            print(
+                f"| {item['scheduled'].strftime('%I:%M:%S %p')} | {departure_time} | {markdown_cell(train)} | "
+                f"{display_delay(item['raw_delay'])} | {markdown_cell(stop_status)} | "
+                f"{location} | {distance_text} | {remaining_text} |"
+            )
+
+
+        print()
+        print("*估算发车 = 计划时间 + 班次板 SEC_LATE，非 GPS 推算；OnTime 是另一独立分类字段。GPS 坐标及时间取同一条完整记录。余站从 NEXT_STOP 开始，包含下一站与目标站；下一站记录超过 120 秒或与已出站记录冲突时不显示余站。")
+
+        if station_identity(origin) == "secaucus junction":
+            minimum_lead = timedelta(minutes=HOME_TO_PLATFORM_MINUTES + BOARDING_BUFFER_MINUTES)
+            safe = next((item for item in departures if item["boarding_time"] >= now + minimum_lead), None)
+            tight = next((item for item in departures if item["boarding_time"] >= now + timedelta(minutes=HOME_TO_PLATFORM_MINUTES)), None)
+            if safe:
+                leave_at = max(now, safe["boarding_time"] - minimum_lead)
+                print(
+                    f"RVR 出发建议：{leave_at.strftime('%I:%M:%S %p ET')} 前出发，"
+                    f"赶 {safe['train_id']} 次（估算 {safe['estimated'].strftime('%I:%M:%S %p ET')}；"
+                    f"出发建议保守按 {safe['boarding_time'].strftime('%I:%M:%S %p ET')} 留足 12 分钟，不依赖晚点持续）。"
+                )
+            elif tight:
+                print(f"RVR 出发建议：没有留足缓冲的班次；{tight['train_id']} 只有现在立刻出发才可能赶上。")
+            else:
+                print("RVR 出发建议：当前列表里没有仍可从 RVR 赶上的班次。")
+
+    advisories = route_advisories(board_payload, origin, destination, departures)
+    if advisories:
+        print()
+        print(f"相关服务提示（{len(advisories)} 条，最多显示 2 条）：")
+        for message in advisories[:2]:
+            compact = message if len(message) <= 240 else message[:237].rstrip() + "…"
+            print(f"- {compact}")
+
+
+def run_route_query(origin: str, destination: str) -> int:
+    username, password, api_base = credentials()
+    client = RailDataClient(username, password, api_base)
+    station_list = client.call("getStationList")
+    station_code, station_label = resolve_station_code(station_list, origin, destination)
+
+    # Warm the token before parallel independent reads so a missing/expired
+    # token cannot cause duplicate issuance when the requests start together.
+    client.token()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        board_future = executor.submit(client.call, "getTrainSchedule", {"station": station_code})
+        vehicle_future = executor.submit(client.call, "getVehicleData")
+        board_payload = board_future.result()
+        vehicle_payload = vehicle_future.result()
+
+    now = datetime.now(ZoneInfo("America/New_York"))
+    print_route_board(
+        origin,
+        destination,
+        station_label,
+        board_payload,
+        as_rows(vehicle_payload),
+        now,
+    )
+    return 0
 
 
 def print_departure_recommendation(
@@ -379,9 +829,7 @@ def print_departure_recommendation(
 
         train_id = str(value(row, "TRAIN_ID", "")).strip()
         vehicle = vehicle_by_id.get(train_id, {})
-        latitude = str(value(row, "GPSLATITUDE", "") or value(vehicle, "LATITUDE", "")).strip()
-        longitude = str(value(row, "GPSLONGITUDE", "") or value(vehicle, "LONGITUDE", "")).strip()
-        gps_time = str(value(row, "GPSTIME", "") or value(vehicle, "LAST_MODIFIED", "")).strip()
+        latitude, longitude, gps_time = select_gps_sample(row, vehicle, now)
         departures.append({
             "row": row,
             "train_id": train_id,
@@ -606,7 +1054,19 @@ def print_train(row: dict[str, object]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Show live NJ TRANSIT departures for an origin and destination station."
+    )
+    parser.add_argument("origin", nargs="?", help="origin station name")
+    parser.add_argument("destination", nargs="?", help="destination station name")
+    args = parser.parse_args()
+    if bool(args.origin) != bool(args.destination):
+        parser.error("provide both an origin and a destination station, or neither")
+
     try:
+        if args.origin and args.destination:
+            return run_route_query(args.origin, args.destination)
+
         username, password, api_base = credentials()
         client = RailDataClient(username, password, api_base)
 

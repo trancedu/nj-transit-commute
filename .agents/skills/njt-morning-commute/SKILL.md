@@ -16,11 +16,20 @@ Use this workflow when the user asks which train to take or when to leave for th
 
 ## Get a fresh live snapshot
 
-For a current commute decision, refresh the production RailData feed for that request. Use the project CLI from the repository root:
+For a current commute decision, refresh the production RailData feed for that request. Use the project CLI from the repository root. The no-argument form is the focused RVR → Secaucus → Penn board:
 
 ```sh
 uv run python njt_commute.py
 ```
+
+For a station-to-station query, pass the origin and destination names directly:
+
+```sh
+uv run python njt_commute.py "Secaucus Junction" "New York Penn"
+uv run python njt_commute.py "Secaucus Junction" "Hoboken"
+```
+
+This command resolves the origin code from the live station list, queries the matching station board, and fetches live vehicle positions in parallel. For Secaucus, the destination selects Upper Level for New York Penn and Lower Level for Hoboken. It prints a Markdown table with departure time, the board's delay field, origin stop status, GPS coordinates and age, straight-line distance to Secaucus, and remaining stops when `NEXT_STOP` matches the train's ordered stop list. The remaining-stop count includes the next stop and destination. If `NEXT_STOP` is unavailable, unmatched, or stale, mark the count unavailable or qualify it with the vehicle timestamp. Do not infer destination-specific delay from the train's current delay; omit that column unless the user asks and the API provides a separate value. Keep planned departure (DEP_TIME / SCHED_DEP_DATE) separate from the delay-adjusted estimate (SCHED_DEP_DATE + SEC_LATE). Their difference normally represents delay, not a data conflict. Show OnTime as a separate categorical field. Use the upcoming planned time conservatively for boarding advice, clearly distinguishing it from the displayed estimate. Select GPS coordinates and timestamp from one complete sample. Use the vehicle timestamp for NEXT_STOP freshness and omit remaining counts over 120 seconds old or contradicted by DEPARTED=YES. Show counts to both origin and destination. Only add the RVR 12-minute leave-by calculation when the origin is Secaucus Junction; for other origin stations, show train departure choices without assuming the user's access time.
 
 The CLI uses the production API by default and reuses its local token cache. Use this existing authentication and API flow instead of rebuilding it. Do not use test-feed data as live data or substitute web search for the current API snapshot. If the live call fails or access is unavailable, say that current data could not be confirmed; do not rely on an older run. Follow the active environment's network and approval controls.
 
@@ -47,4 +56,4 @@ The station board is the primary source. If it returns no usable Penn-bound rows
 
 ## Response shape
 
-Lead with the suggested leave time and train when the feed supports a recommendation. State the 10-minute drive-and-platform estimate and 2-minute boarding buffer. Give a compact comparison of the nearest candidates: train/line, Secaucus departure estimate and delay source, Secaucus status/departed state, Penn time/status, GPS distance and update age, and whether the option is safe, tight, or unreachable. State the snapshot time, surface relevant advisories, and distinguish direct-board values from fallback estimates.
+Lead with the suggested leave time and train when the feed supports a recommendation. State the 10-minute drive-and-platform estimate and 2-minute boarding buffer. For station-to-station queries, preserve the CLI's Markdown table and briefly explain its columns. State the snapshot time, surface relevant advisories, and distinguish direct-board values from fallback estimates. For New York Penn, do not add an arrival-delay column based on `SEC_LATE`; show a Penn stop time/status only when it helps and label it as the feed value.

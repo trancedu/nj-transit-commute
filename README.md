@@ -1,6 +1,6 @@
-# NJ TRANSIT Secaucus commute board
+# NJ TRANSIT station-to-station board
 
-A small, read-only CLI for the Secaucus Junction → New York Penn commute. It shows upcoming Penn-bound departures, headways, live coordinates, straight-line distance from each reported train position to Secaucus Junction, and delay/status details at the Secaucus and New York Penn stops when the feed provides them. It calculates when to leave home using 7 minutes of driving, 3 minutes to the platform, and a 2-minute boarding buffer. It does not show Hoboken service.
+A small, read-only CLI for live NJ TRANSIT station-to-station queries. The no-argument view remains focused on the RVR → Secaucus Junction → New York Penn commute. Pass an origin and destination to query another route; for Secaucus Junction, the script resolves Upper Level for New York Penn and Lower Level for Hoboken. Route queries print a Markdown table with departure time, board delay, stop status, GPS position and age, straight-line distance to Secaucus, and the number of stops remaining when the vehicle's `NEXT_STOP` can be matched to its stop list. Destination-specific delay is not inferred from the vehicle delay. For Secaucus routes the script also calculates RVR leave-by times using 7 minutes driving, 3 minutes to the platform, and a 2-minute boarding buffer.
 
 ## Set up
 
@@ -10,6 +10,15 @@ A small, read-only CLI for the Secaucus Junction → New York Penn commute. It s
    ```sh
    uv run python njt_commute.py
    ```
+
+   To query a route directly, pass the station names as two arguments:
+
+   ```sh
+   uv run python njt_commute.py "Secaucus Junction" "Hoboken"
+   uv run python njt_commute.py "Secaucus Junction" "New York Penn"
+   ```
+
+   The route command reads the station list, resolves the correct board, and fetches the station board and live vehicle feed in parallel. GPS and next-stop fields come from the last vehicle report; the table shows how old that report is. The stop count includes the next stop and destination, and is omitted when the train's `NEXT_STOP` cannot be matched to its stop list. The table separates planned departure (`SCHED_DEP_DATE` / `DEP_TIME`) from the delay-adjusted estimate (`SCHED_DEP_DATE + SEC_LATE`). A later estimate is not a conflict with the planned time. Boarding advice uses the upcoming planned time conservatively, without relabeling it as the estimate. GPS coordinates and their timestamp are selected as one complete sample; next-stop freshness is checked separately. Remaining stops are shown to both the boarding station and destination, and omitted when the next-stop record is over 120 seconds old or contradicts a departed stop.
 
    If the `.env` lives elsewhere, set `NJT_ENV_FILE=/path/to/.env` before running.
 
