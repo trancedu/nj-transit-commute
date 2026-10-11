@@ -1,0 +1,9 @@
+[project]
+name = "njt-commute"
+version = "0.1.0"
+description = "A read-only NJ TRANSIT RailData commute board for Secaucus Junction to New York Penn."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false

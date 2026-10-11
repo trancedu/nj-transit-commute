@@ -1,0 +1,19 @@
+# Local credentials and cached API tokens
+.env
+.env.*
+!.env.example
+*.env
+*.token.json
+.njt_token.json
+
+# Local Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor files
+.DS_Store
