@@ -25,6 +25,11 @@ BOARDING_BUFFER_MINUTES = 2
 SECAUCUS_LATITUDE = 40.76128
 SECAUCUS_LONGITUDE = -74.07569
 EARTH_RADIUS_MILES = 3958.7613
+SECAUCUS_LEVEL_BY_DESTINATION = {
+    "new york penn": "upper",
+    "ny penn": "upper",
+    "hoboken": "lower",
+}
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -197,18 +202,40 @@ class RailDataClient:
         return payload
 
 
-def find_secaucus_code(payload: object) -> str:
+def find_secaucus_code(payload: object, destination: str = "New York Penn") -> str:
     stations = payload if isinstance(payload, list) else []
+    destination_key = destination.casefold().strip()
+    level = SECAUCUS_LEVEL_BY_DESTINATION.get(destination_key)
+    if level is None:
+        raise RuntimeError(f"No Secaucus platform mapping is configured for {destination}.")
+
+    platform_entries_exist = False
+    generic_codes: list[str] = []
     for station in stations:
         name = " ".join(
             str(value(station, field, ""))
             for field in ("STATIONNAME", "STATION_14CHAR")
         )
-        if "secaucus" in name.casefold():
-            code = value(station, "STATION_2CHAR")
-            if code:
+        lowered = name.casefold()
+        if "secaucus" not in lowered:
+            continue
+
+        code = value(station, "STATION_2CHAR")
+        if not code:
+            continue
+        if "upper" in lowered or "lower" in lowered:
+            platform_entries_exist = True
+            if level in lowered:
                 return str(code)
-    raise RuntimeError("The RailData station list did not contain Secaucus Junction.")
+        elif "concourse" not in lowered:
+            generic_codes.append(str(code))
+
+    # Some station lists expose only a single, unqualified Secaucus entry.
+    # If platform-specific entries exist, never silently fall back to another
+    # level or to the concourse.
+    if not platform_entries_exist and generic_codes:
+        return generic_codes[0]
+    raise RuntimeError(f"The RailData station list did not contain Secaucus {level} level.")
 
 
 def as_rows(payload: object) -> list[dict[str, object]]:
@@ -584,7 +611,9 @@ def main() -> int:
         client = RailDataClient(username, password, api_base)
 
         # Resolve the API's two-character station code from its own station list.
-        station_code = find_secaucus_code(client.call("getStationList"))
+        station_code = find_secaucus_code(
+            client.call("getStationList"), destination="New York Penn"
+        )
         board = client.call("getTrainSchedule", {"station": station_code})
         rows = as_rows(board)
         now = datetime.now(ZoneInfo("America/New_York"))

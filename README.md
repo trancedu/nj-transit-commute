@@ -15,10 +15,14 @@ A small, read-only CLI for the Secaucus Junction → New York Penn commute. It s
 
 The project requires Python 3.10 or newer, uses only the Python standard library, and defaults to production at `https://raildata.njtransit.com/api/TrainData`. For the test environment, set `NJT_API_BASE=https://testraildata.njtransit.com/api/TrainData`. The RailData token is requested only when no local token is cached or the API rejects the cached token. The cache is stored in `.njt_token.json` with owner-only file permissions where supported; neither the token nor the credentials are printed.
 
+## Codex skill
+
+The reusable commute workflow is in `.agents/skills/njt-morning-commute/SKILL.md`. Codex discovers repository skills from `.agents/skills/`; invoke it explicitly with `$njt-morning-commute` when needed. It includes the Secaucus Upper Level → New York Penn and Lower Level → Hoboken mapping, along with the live-feed and departure-planning steps.
+
 ## API flow and useful operations
 
 - `POST /TrainData/getToken` — multipart fields `username`, `password`; the documented response has `Authenticated` and `UserToken`.
-- `POST /TrainData/getStationList` — multipart `token`; use `STATION_2CHAR` from the returned row whose name is Secaucus Junction.
+- `POST /TrainData/getStationList` — multipart `token`; Secaucus has separate concourse and platform entries. Resolve the platform from the destination: New York Penn uses `Secaucus Upper Lvl` (currently `SE`), and Hoboken uses `Secaucus Lower Lvl` (currently `TS`). Do not use `Secaucus Concourse` (`SC`) as a train platform; it returned an empty board in the production check. The codes come from the live station list and should be resolved by name rather than hardcoded.
 - `POST /TrainData/getTrainSchedule` — multipart `token`, `station`; the response includes departures, GPS coordinates/time, status/delay/track fields, stop times/status, inline messages, and station messages.
 - `POST /TrainData/getStationMSG` — station/line messages when a separate message lookup is needed.
 - `POST /TrainData/getVehicleData` — train IDs, directions, track circuits, next stops, coordinates, update times, and seconds late for active trains.
