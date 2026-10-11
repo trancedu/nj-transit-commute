@@ -16,7 +16,7 @@ Use this workflow when the user asks which train to take or when to leave for th
 
 ## Get a fresh live snapshot
 
-For a current commute decision, refresh the production RailData feed for that request. Use the project CLI from the repository root. The no-argument form is the focused RVR → Secaucus → Penn board:
+For a current commute decision, refresh the production RailData feed for that request. On this user's machine, the repository is `/Users/codex/workspace/njtransit`. Run the project CLI with that directory as the working directory, even when the chat belongs to another project. If that checkout is unavailable, locate the user's checkout before running; do not assume the current chat directory contains the script. The no-argument form is the focused RVR → Secaucus → Penn board:
 
 ```sh
 uv run python njt_commute.py
